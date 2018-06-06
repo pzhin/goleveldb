@@ -63,60 +63,40 @@ retry:
 	return
 }
 
-func (db *DB) flush(n int) (mdb *memDB, mdbFree int, err error) {
+func (db *DB) flush(n int) (*memDB, error) {
 	delayed := false
 	slowdownTrigger := db.s.o.GetWriteL0SlowdownTrigger()
 	pauseTrigger := db.s.o.GetWriteL0PauseTrigger()
-	flush := func() (retry bool) {
-		mdb = db.getEffectiveMem()
-		if mdb == nil {
-			err = ErrClosed
-			return false
-		}
-		defer func() {
-			if retry {
-				mdb.decref()
-				mdb = nil
-			}
-		}()
-		tLen := db.s.tLen(0)
-		mdbFree = mdb.Free()
-		switch {
-		case tLen >= slowdownTrigger && !delayed:
-			delayed = true
-			time.Sleep(time.Millisecond)
-		case mdbFree >= n:
-			return false
-		case tLen >= pauseTrigger:
-			delayed = true
-			// Set the write paused flag explicitly.
-			atomic.StoreInt32(&db.inWritePaused, 1)
-			err = db.compTriggerWait(db.tcompCmdC)
-			// Unset the write paused flag.
-			atomic.StoreInt32(&db.inWritePaused, 0)
-			if err != nil {
-				return false
-			}
-		default:
-			// Allow memdb to grow if it has no entry.
-			if mdb.Len() == 0 {
-				mdbFree = n
-			} else {
-				mdb.decref()
-				mdb, err = db.rotateMem(n, false)
-				if err == nil {
-					mdbFree = mdb.Free()
-				} else {
-					mdbFree = 0
-				}
-			}
-			return false
-		}
-		return true
-	}
 	start := time.Now()
-	for flush() {
+	mdb := db.getEffectiveMem()
+	if mdb == nil {
+		return nil, ErrClosed
 	}
+
+	tLen := db.s.tLen(0)
+	mdbFree := mdb.Free()
+	if tLen >= pauseTrigger {
+		delayed = true
+		// Set the write paused flag explicitly.
+		atomic.StoreInt32(&db.inWritePaused, 1)
+		err := db.compTriggerWait(db.tcompCmdC) // Unset the write paused flag.
+		atomic.StoreInt32(&db.inWritePaused, 0)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if tLen >= slowdownTrigger && !delayed {
+		delayed = true
+		time.Sleep(time.Millisecond)
+	}
+
+	if mdbFree < n && mdb.Len() != 0 {
+		// Allow memdb to grow if it has no entry.
+		mdb.decref()
+		return db.rotateMem(n, false)
+	}
+
 	if delayed {
 		db.writeDelay += time.Since(start)
 		db.writeDelayN++
@@ -127,7 +107,8 @@ func (db *DB) flush(n int) (mdb *memDB, mdbFree int, err error) {
 		db.writeDelay = 0
 		db.writeDelayN = 0
 	}
-	return
+
+	return mdb, nil
 }
 
 type writeMerge struct {
@@ -152,12 +133,14 @@ func (db *DB) unlockWrite(overflow bool, merged int, err error) {
 func (db *DB) writeLocked(batch *Batch, merge, sync bool) error {
 	// Try to flush memdb. This method would also trying to throttle writes
 	// if it is too fast and compaction cannot catch-up.
-	mdb, mdbFree, err := db.flush(batch.internalLen)
+	mdb, err := db.flush(batch.internalLen)
 	if err != nil {
 		db.unlockWrite(false, 0, err)
 		return err
 	}
 	defer mdb.decref()
+
+	mdbFree := mdb.Free()
 
 	var (
 		overflow bool
